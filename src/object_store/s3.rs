@@ -17,18 +17,19 @@
 
 //! ObjectStore implementation for the Amazon S3 API
 
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{stream, AsyncRead};
 
-use datafusion::datasource::object_store::SizedFile;
-use datafusion::datasource::object_store::{
-    FileMeta, FileMetaStream, ListEntryStream, ObjectReader, ObjectStore,
+use datafusion::datafusion_data_access::object_store::{
+    FileMetaStream, ListEntryStream, ObjectReader, ObjectStore,
 };
-use datafusion::error::{DataFusionError, Result};
+use datafusion::datafusion_data_access::Result;
+use datafusion::datafusion_data_access::{FileMeta, SizedFile};
+use std::io::Error;
 
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::{config::Builder, Client, Endpoint, Region, RetryConfig};
@@ -37,8 +38,6 @@ use aws_smithy_types::timeout::Config;
 use aws_smithy_types_convert::date_time::DateTimeExt;
 use aws_types::credentials::SharedCredentialsProvider;
 use bytes::Buf;
-
-use crate::error::S3Error;
 
 /// new_client creates a new aws_sdk_s3::Client
 /// this uses aws_config::load_from_env() as a base config then allows users to override specific settings if required
@@ -133,7 +132,13 @@ impl ObjectStore for S3FileSystem {
             .prefix(prefix)
             .send()
             .await
-            .map_err(|err| DataFusionError::External(Box::new(S3Error::AWS(format!("{:?}", err)))))?
+            .map_err(|err| {
+                Error::new(
+                    ErrorKind::Other,
+                    format!("Error listing S3 bucket: {:?}", err),
+                )
+            })?
+            // .map_err(|err| DataFusionError::External(Box::new(S3Error::AWS(format!("{:?}", err)))))?
             .contents()
             .unwrap_or_default()
             .to_vec();
@@ -267,15 +272,16 @@ impl ObjectReader for AmazonS3FileReader {
                         let data = res.body.collect().await;
                         match data {
                             Ok(data) => Ok(data.into_bytes()),
-                            Err(err) => Err(DataFusionError::External(Box::new(S3Error::AWS(
-                                format!("{:?}", err),
-                            )))),
+                            Err(err) => Err(Error::new(
+                                ErrorKind::Other,
+                                format!("Error reading object: {:?}", err),
+                            )),
                         }
                     }
-                    Err(err) => Err(DataFusionError::External(Box::new(S3Error::AWS(format!(
-                        "{:?}",
-                        err
-                    ))))),
+                    Err(err) => Err(Error::new(
+                        ErrorKind::Other,
+                        format!("Error reading object: {:?}", err),
+                    )),
                 };
 
                 tx.send(bytes).unwrap();
@@ -283,7 +289,8 @@ impl ObjectReader for AmazonS3FileReader {
         });
 
         let bytes = rx.recv_timeout(Duration::from_secs(10)).map_err(|err| {
-            DataFusionError::External(Box::new(S3Error::AWS(format!("{:?}", err))))
+            Error::new(ErrorKind::TimedOut, format!("S3 Error: {:?}", err))
+            // DataFusionError::External(Box::new(S3Error::AWS(format!("{:?}", err))))
         })??;
 
         Ok(Box::new(bytes.reader()))
@@ -301,7 +308,8 @@ mod tests {
     use datafusion::assert_batches_eq;
     use datafusion::datasource::listing::*;
     use datafusion::datasource::TableProvider;
-    use datafusion::prelude::ExecutionContext;
+    use datafusion::error::Result;
+    use datafusion::prelude::SessionContext;
     use futures::StreamExt;
     use http::Uri;
 
@@ -461,7 +469,7 @@ mod tests {
 
         let table = ListingTable::try_new(config)?;
 
-        let mut ctx = ExecutionContext::new();
+        let ctx = SessionContext::new();
 
         ctx.register_table("tbl", Arc::new(table)).unwrap();
 
@@ -533,11 +541,12 @@ mod tests {
             .await,
         );
 
-        let ctx = ExecutionContext::new();
+        let ctx = SessionContext::new();
 
-        ctx.register_object_store("s3", s3_file_system);
+        ctx.runtime_env()
+            .register_object_store("s3", s3_file_system);
 
-        let (_, name) = ctx.object_store("s3").unwrap();
+        let (_, name) = ctx.runtime_env().object_store("s3").unwrap();
         assert_eq!(name, "s3");
 
         Ok(())
